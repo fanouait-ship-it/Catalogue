@@ -70,7 +70,7 @@ jobs:
 
           def call(variables):
               body = json.dumps({"query": QUERY, "variables": variables}).encode()
-              headers = {"Content-Type": "application/json", "Accept": "application/json"}
+              headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 anilist-backup/1.0"}
               for attempt in range(10):
                   try:
                       req = urllib.request.Request(URL, body, headers)
@@ -215,7 +215,7 @@ jobs:
 
           def post(query, variables, shrinkable):
               body = json.dumps({"query": query, "variables": variables}).encode()
-              headers = {"Content-Type": "application/json", "Accept": "application/json"}
+              headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 anilist-backup/1.0"}
               for attempt in range(10):
                   try:
                       req = urllib.request.Request(URL, body, headers)
