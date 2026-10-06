@@ -27,6 +27,7 @@ jobs:
           URL = os.environ.get("ANILIST_URL", "https://graphql.anilist.co")
           MEDIA_TYPE = os.environ["MEDIA_TYPE"]
           PAUSE = float(os.environ.get("PAUSE", "0.8"))
+          GAP = int(os.environ.get("GAP", "30000"))   # arrêt après autant d'ID consécutifs vides
           MAX_PP = 50
 
           FIELDS = """
@@ -59,17 +60,17 @@ jobs:
             }
           """
           QUERY = """
-          query ($type: MediaType, $last: Int, $pp: Int) {
+          query ($type: MediaType, $ids: [Int], $pp: Int) {
             Page(page: 1, perPage: $pp) {
-              media(type: $type, id_greater: $last, sort: ID) { %s }
+              media(type: $type, id_in: $ids, sort: ID) { %s }
             }
           }""".replace("%s", FIELDS)
 
           class TooComplex(Exception):
               pass
 
-          def call(variables):
-              body = json.dumps({"query": QUERY, "variables": variables}).encode()
+          def call(variables, query=None):
+              body = json.dumps({"query": query or QUERY, "variables": variables}).encode()
               headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 anilist-backup/1.0"}
               for attempt in range(10):
                   try:
@@ -80,10 +81,12 @@ jobs:
                           raise RuntimeError(str(data["errors"])[:300])
                       return data["data"]["Page"]["media"]
                   except urllib.error.HTTPError as e:
-                      txt = e.read().decode("utf-8", "ignore")[:300]
+                      txt = e.read().decode("utf-8", "ignore")[:600]
+                      if e.code == 400 and ("Unknown argument" in txt or "Cannot query field" in txt or "Unknown type" in txt):
+                          raise SystemExit("Erreur de schéma GraphQL : " + txt)
                       if e.code == 429:
                           wait = int(e.headers.get("Retry-After", 60)) + 1
-                      elif e.code in (400, 404, 500) and variables["pp"] > 1 and attempt >= 1:
+                      elif e.code in (400, 404, 500) and variables.get("pp", 1) > 1 and attempt >= 1:
                           raise TooComplex(txt)
                       else:
                           wait = 5 * (attempt + 1)
@@ -94,30 +97,38 @@ jobs:
                       time.sleep(5 * (attempt + 1))
               raise SystemExit("Échec après plusieurs essais")
 
+          MAX_ID = call({"type": MEDIA_TYPE},
+                        "query ($type: MediaType) { Page(page: 1, perPage: 1) { media(type: $type, sort: ID_DESC) { id } } }")[0]["id"]
+          print(f"{MEDIA_TYPE}: plus grand ID = {MAX_ID}", flush=True)
           path = f"out/{MEDIA_TYPE.lower()}.json.gz"
-          pp, streak, last, count, first = MAX_PP, 0, 0, 0, True
+          pp, streak, cur, empty, last, count, first = MAX_PP, 0, 1, 0, 0, 0, True
           t0 = time.time()
 
           with gzip.open(path, "wt", encoding="utf-8") as f:
               f.write("[")
               try:
-                  while True:
+                  while cur <= MAX_ID:
+                      ids = list(range(cur, cur + pp))
                       try:
-                          batch = call({"type": MEDIA_TYPE, "last": last, "pp": pp})
+                          batch = call({"type": MEDIA_TYPE, "ids": ids, "pp": pp})
                       except TooComplex:
                           if pp == 1:
-                              raise SystemExit(f"Fiche bloquante après id {last}")
+                              raise SystemExit(f"Fiche bloquante à l'id {cur}")
                           pp = max(1, pp // 2)
                           streak = 0
                           print(f"Requête trop lourde -> perPage = {pp}", flush=True)
                           continue
+                      cur += len(ids)
                       if not batch:
-                          break
+                          empty += len(ids)
+                          time.sleep(PAUSE)
+                          continue
+                      empty = 0
                       for m in batch:
                           f.write(("" if first else ",") + json.dumps(m, ensure_ascii=False))
                           first = False
                       count += len(batch)
-                      last = batch[-1]["id"]
+                      last = max(last, batch[-1]["id"])
                       streak += 1
                       if streak >= 10 and pp < MAX_PP:
                           pp, streak = min(MAX_PP, pp * 2), 0
@@ -225,7 +236,9 @@ jobs:
                           raise RuntimeError(str(data["errors"])[:300])
                       return data["data"]
                   except urllib.error.HTTPError as e:
-                      txt = e.read().decode("utf-8", "ignore")[:300]
+                      txt = e.read().decode("utf-8", "ignore")[:600]
+                      if e.code == 400 and ("Unknown argument" in txt or "Cannot query field" in txt or "Unknown type" in txt):
+                          raise SystemExit("Erreur de schéma GraphQL : " + txt)
                       if e.code == 429:
                           wait = int(e.headers.get("Retry-After", 60)) + 1
                       elif e.code in (400, 500) and shrinkable and attempt >= 1:
@@ -239,6 +252,9 @@ jobs:
                       time.sleep(5 * (attempt + 1))
               raise SystemExit("Échec après plusieurs essais")
 
+          Q_MAX = f"query {{ Page(page: 1, perPage: 1) {{ {ROOT}(sort: ID_DESC) {{ id }} }} }}"
+          MAX_ID = post(Q_MAX, {}, False)["Page"][ROOT][0]["id"]
+          print(f"{KIND}: plus grand ID = {MAX_ID}", flush=True)
           path = f"out/{CFG['file']}.json.gz"
           cur, pp, streak, empty, count, first, reqs = 1, MAX_PP, 0, 0, 0, True, 0
           t0 = time.time()
@@ -246,7 +262,7 @@ jobs:
           with gzip.open(path, "wt", encoding="utf-8") as f:
               f.write("[")
               try:
-                  while empty < GAP:
+                  while cur <= MAX_ID:
                       ids = list(range(cur, cur + pp))
                       try:
                           batch = post(Q_PAGE, {"ids": ids, "pp": pp}, pp > 1)["Page"][ROOT]
