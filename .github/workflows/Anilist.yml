@@ -1,0 +1,315 @@
+name: AniList vers MEGA
+on:
+  workflow_dispatch:
+
+jobs:
+  # ───────────────────────── ANIME + MANGA ─────────────────────────
+  media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        media_type: [ANIME, MANGA]
+    env:
+      MEDIA_TYPE: ${{ matrix.media_type }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Télécharger toutes les données (${{ matrix.media_type }})
+        run: |
+          mkdir -p out
+          python - <<'PY'
+          import gzip, json, os, time, urllib.request, urllib.error
+
+          URL = os.environ.get("ANILIST_URL", "https://graphql.anilist.co")
+          MEDIA_TYPE = os.environ["MEDIA_TYPE"]
+          PAUSE = float(os.environ.get("PAUSE", "0.8"))
+          MAX_PP = 50
+
+          FIELDS = """
+            id idMal type format status
+            title { romaji english native userPreferred }
+            synonyms
+            description(asHtml: false)
+            startDate { year month day }
+            endDate { year month day }
+            season seasonYear seasonInt
+            episodes duration chapters volumes
+            countryOfOrigin isLicensed source(version: 3) hashtag
+            trailer { id site thumbnail }
+            updatedAt
+            coverImage { extraLarge large medium color }
+            bannerImage
+            genres
+            tags { id name description category rank isGeneralSpoiler isMediaSpoiler isAdult }
+            averageScore meanScore popularity trending favourites
+            isAdult isLocked siteUrl
+            nextAiringEpisode { airingAt timeUntilAiring episode }
+            externalLinks { id url site type language color icon isDisabled notes }
+            streamingEpisodes { title thumbnail url site }
+            rankings { id rank type format year season allTime context }
+            studios { edges { isMain node { id name isAnimationStudio siteUrl favourites } } }
+            relations { edges { id relationType(version: 2) node { id idMal type format title { romaji english native } } } }
+            stats {
+              scoreDistribution { score amount }
+              statusDistribution { status amount }
+            }
+          """
+          QUERY = """
+          query ($type: MediaType, $last: Int, $pp: Int) {
+            Page(page: 1, perPage: $pp) {
+              media(type: $type, id_greater: $last, sort: ID) { %s }
+            }
+          }""".replace("%s", FIELDS)
+
+          class TooComplex(Exception):
+              pass
+
+          def call(variables):
+              body = json.dumps({"query": QUERY, "variables": variables}).encode()
+              headers = {"Content-Type": "application/json", "Accept": "application/json"}
+              for attempt in range(10):
+                  try:
+                      req = urllib.request.Request(URL, body, headers)
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          data = json.load(r)
+                      if data.get("errors") and not data.get("data"):
+                          raise RuntimeError(str(data["errors"])[:300])
+                      return data["data"]["Page"]["media"]
+                  except urllib.error.HTTPError as e:
+                      txt = e.read().decode("utf-8", "ignore")[:300]
+                      if e.code == 429:
+                          wait = int(e.headers.get("Retry-After", 60)) + 1
+                      elif e.code in (400, 404, 500) and variables["pp"] > 1 and attempt >= 1:
+                          raise TooComplex(txt)
+                      else:
+                          wait = 5 * (attempt + 1)
+                      print(f"HTTP {e.code} {txt[:120]!r} -> pause {wait}s", flush=True)
+                      time.sleep(wait)
+                  except Exception as e:
+                      print("Erreur:", e, flush=True)
+                      time.sleep(5 * (attempt + 1))
+              raise SystemExit("Échec après plusieurs essais")
+
+          path = f"out/{MEDIA_TYPE.lower()}.json.gz"
+          pp, streak, last, count, first = MAX_PP, 0, 0, 0, True
+          t0 = time.time()
+
+          with gzip.open(path, "wt", encoding="utf-8") as f:
+              f.write("[")
+              try:
+                  while True:
+                      try:
+                          batch = call({"type": MEDIA_TYPE, "last": last, "pp": pp})
+                      except TooComplex:
+                          if pp == 1:
+                              raise SystemExit(f"Fiche bloquante après id {last}")
+                          pp = max(1, pp // 2)
+                          streak = 0
+                          print(f"Requête trop lourde -> perPage = {pp}", flush=True)
+                          continue
+                      if not batch:
+                          break
+                      for m in batch:
+                          f.write(("" if first else ",") + json.dumps(m, ensure_ascii=False))
+                          first = False
+                      count += len(batch)
+                      last = batch[-1]["id"]
+                      streak += 1
+                      if streak >= 10 and pp < MAX_PP:
+                          pp, streak = min(MAX_PP, pp * 2), 0
+                      if count % 2000 < pp:
+                          print(f"{MEDIA_TYPE} {count} (id {last}, perPage {pp}, {int(time.time()-t0)}s)", flush=True)
+                      time.sleep(PAUSE)
+              finally:
+                  f.write("]")
+
+          with open(f"out/{MEDIA_TYPE.lower()}_meta.json", "w") as m:
+              json.dump({"type": MEDIA_TYPE, "count": count, "last_id": last,
+                         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, m)
+          print(f"{MEDIA_TYPE}: {count} entrées -> {path}", flush=True)
+          PY
+
+      - name: Sauvegarde de secours (artifact GitHub)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anilist-${{ matrix.media_type }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Installer rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Envoyer vers MEGA
+        if: always()
+        env:
+          RCLONE_CONFIG_MEGA_TYPE: mega
+          RCLONE_CONFIG_MEGA_USER: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: |
+          export RCLONE_CONFIG_MEGA_PASS="$(rclone obscure "$MEGA_PASSWORD")"
+          rclone copy out/ mega:anilist/ --transfers 2 --retries 5 --low-level-retries 10 --progress
+
+  # ───────────────────────── PERSONNAGES + STAFF ─────────────────────────
+  people:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [CHARACTER, STAFF]
+    env:
+      KIND: ${{ matrix.kind }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Télécharger toutes les données (${{ matrix.kind }})
+        run: |
+          mkdir -p out
+          python - <<'PY'
+          import gzip, json, os, time, urllib.request, urllib.error
+
+          URL = os.environ.get("ANILIST_URL", "https://graphql.anilist.co")
+          KIND = os.environ["KIND"]
+          PAUSE = float(os.environ.get("PAUSE", "0.75"))
+          GAP = int(os.environ.get("GAP", "30000"))   # arrêt après autant d'ID consécutifs vides
+          MAX_PP = 50
+          TITLE = "title { romaji english native }"
+          NAME = "name { first middle last full native alternative userPreferred }"
+
+          CFG = {
+              "CHARACTER": dict(
+                  root="characters", single="Character", file="characters",
+                  scalars="id name { first middle last full native alternative alternativeSpoiler userPreferred } "
+                          "image { large medium } description(asHtml: false) gender "
+                          "dateOfBirth { year month day } age bloodType siteUrl favourites",
+                  conns={"media": "edges { id characterRole characterName "
+                                  f"node {{ id idMal type format {TITLE} }} "
+                                  "voiceActors { id languageV2 name { full native } } }"}),
+              "STAFF": dict(
+                  root="staff", single="Staff", file="staff",
+                  scalars=f"id {NAME} languageV2 image {{ large medium }} description(asHtml: false) "
+                          "primaryOccupations gender dateOfBirth { year month day } "
+                          "dateOfDeath { year month day } age yearsActive homeTown bloodType siteUrl favourites",
+                  conns={"staffMedia": f"edges {{ id staffRole node {{ id idMal type format {TITLE} }} }}",
+                         "characters": "edges { id role node { id name { full native } } }"}),
+          }[KIND]
+
+          ROOT, SINGLE, CONNS = CFG["root"], CFG["single"], CFG["conns"]
+          conn_sel = " ".join(f"{c}(sort: ID, perPage: 25) {{ pageInfo {{ hasNextPage }} {b} }}" for c, b in CONNS.items())
+          Q_PAGE = (f"query ($ids: [Int], $pp: Int) {{ Page(page: 1, perPage: $pp) "
+                    f"{{ {ROOT}(id_in: $ids) {{ {CFG['scalars']} {conn_sel} }} }} }}")
+          Q_MORE = {c: (f"query ($id: Int, $page: Int) {{ {SINGLE}(id: $id) "
+                        f"{{ {c}(sort: ID, page: $page, perPage: 25) {{ pageInfo {{ hasNextPage }} {b} }} }} }}")
+                    for c, b in CONNS.items()}
+
+          class TooComplex(Exception):
+              pass
+
+          def post(query, variables, shrinkable):
+              body = json.dumps({"query": query, "variables": variables}).encode()
+              headers = {"Content-Type": "application/json", "Accept": "application/json"}
+              for attempt in range(10):
+                  try:
+                      req = urllib.request.Request(URL, body, headers)
+                      with urllib.request.urlopen(req, timeout=90) as r:
+                          data = json.load(r)
+                      if data.get("errors") and not data.get("data"):
+                          raise RuntimeError(str(data["errors"])[:300])
+                      return data["data"]
+                  except urllib.error.HTTPError as e:
+                      txt = e.read().decode("utf-8", "ignore")[:300]
+                      if e.code == 429:
+                          wait = int(e.headers.get("Retry-After", 60)) + 1
+                      elif e.code in (400, 500) and shrinkable and attempt >= 1:
+                          raise TooComplex(txt)
+                      else:
+                          wait = 5 * (attempt + 1)
+                      print(f"HTTP {e.code} {txt[:160]!r} -> pause {wait}s", flush=True)
+                      time.sleep(wait)
+                  except Exception as e:
+                      print("Erreur:", e, flush=True)
+                      time.sleep(5 * (attempt + 1))
+              raise SystemExit("Échec après plusieurs essais")
+
+          path = f"out/{CFG['file']}.json.gz"
+          cur, pp, streak, empty, count, first, reqs = 1, MAX_PP, 0, 0, 0, True, 0
+          t0 = time.time()
+
+          with gzip.open(path, "wt", encoding="utf-8") as f:
+              f.write("[")
+              try:
+                  while empty < GAP:
+                      ids = list(range(cur, cur + pp))
+                      try:
+                          batch = post(Q_PAGE, {"ids": ids, "pp": pp}, pp > 1)["Page"][ROOT]
+                      except TooComplex:
+                          if pp == 1:
+                              raise SystemExit(f"Fiche bloquante à l'id {cur}")
+                          pp = max(1, pp // 2)
+                          streak = 0
+                          print(f"Requête trop lourde -> perPage = {pp}", flush=True)
+                          continue
+                      cur += len(ids)
+                      reqs += 1
+                      time.sleep(PAUSE)
+                      if not batch:
+                          empty += len(ids)
+                          continue
+                      empty = 0
+                      streak += 1
+                      if streak >= 10 and pp < MAX_PP:
+                          pp, streak = min(MAX_PP, pp * 2), 0
+                      for item in batch:
+                          for c in CONNS:   # pagination complète des listes liées
+                              edges = item[c]["edges"]
+                              more, page = item[c]["pageInfo"]["hasNextPage"], 1
+                              while more:
+                                  page += 1
+                                  d = post(Q_MORE[c], {"id": item["id"], "page": page}, False)[SINGLE][c]
+                                  edges += d["edges"]
+                                  more = d["pageInfo"]["hasNextPage"]
+                                  time.sleep(PAUSE)
+                              item[c] = edges
+                          f.write(("" if first else ",") + json.dumps(item, ensure_ascii=False))
+                          first = False
+                      count += len(batch)
+                      if reqs % 100 == 0:
+                          print(f"{KIND} {count} fiches (id ~{cur}, perPage {pp}, {int(time.time()-t0)}s)", flush=True)
+              finally:
+                  f.write("]")
+
+          with open(f"out/{CFG['file']}_meta.json", "w") as m:
+              json.dump({"type": KIND, "count": count, "last_id_scanned": cur,
+                         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, m)
+          print(f"{KIND}: {count} fiches -> {path}", flush=True)
+          PY
+
+      - name: Sauvegarde de secours (artifact GitHub)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anilist-${{ matrix.kind }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Installer rclone
+        run: curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Envoyer vers MEGA
+        if: always()
+        env:
+          RCLONE_CONFIG_MEGA_TYPE: mega
+          RCLONE_CONFIG_MEGA_USER: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+        run: |
+          export RCLONE_CONFIG_MEGA_PASS="$(rclone obscure "$MEGA_PASSWORD")"
+          rclone copy out/ mega:anilist/ --transfers 2 --retries 5 --low-level-retries 10 --progress
